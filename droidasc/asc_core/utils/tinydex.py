@@ -9,6 +9,65 @@ _STRUCT_III = struct.Struct('<III')
 _STRUCT_HHI = struct.Struct('<HHI')
 _STRUCT_HHHHII = struct.Struct('<HHHHII')
 
+
+def mutf8_end(buf, start : int, utf16_size : int) -> int:
+    """Byte offset one past the MUTF-8 text of `utf16_size` UTF-16 units.
+
+    `utf16_size` in a DEX string_data_item counts UTF-16 CODE UNITS, not
+    bytes. Treating it as a byte count truncates every non-ASCII string:
+    `Ll/᩻ܶ;` is 6 units but 9 bytes, so the old slice decoded as the
+    truncated `Ll/᩻`, the type_ids binary search never matched, and every
+    class in a hardened app's obfuscated package answered
+    "Class ... not found in DEX."
+
+    Walk the MUTF-8 lead bytes instead (1 byte per ASCII unit, 2 per
+    `110xxxxx` — which is also how U+0000 is stored, as `C0 80` — 3 per
+    `1110xxxx`, and 4 for the non-standard `11110xxx` form, which carries
+    a surrogate pair = 2 units).
+    """
+    p = start
+    remaining = utf16_size
+    while remaining > 0:
+        b = buf[p]
+        if b < 0x80 or 0x80 <= b < 0xC0:
+            p += 1
+            remaining -= 1
+        elif b < 0xE0:
+            p += 2
+            remaining -= 1
+        elif b < 0xF0:
+            p += 3
+            remaining -= 1
+        else:
+            p += 4
+            remaining -= 2
+    return p
+
+
+def decode_mutf8(raw : bytes) -> str:
+    """Decode Dalvik MUTF-8 into `str`.
+
+    MUTF-8 differs from UTF-8 in two ways that both matter here: U+0000 is
+    stored overlong as `C0 80` (strict UTF-8 rejects it), and
+    supplementary characters are stored as CESU-8 surrogate pairs (strict
+    UTF-8 rejects those too). Fold the NUL form first, then recombine the
+    surrogates, and only give up on genuinely malformed input.
+    """
+    if b'\xc0\x80' in raw:
+        raw = raw.replace(b'\xc0\x80', b'\x00')
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError:
+        try:
+            return (
+                raw.decode('utf-8', 'surrogatepass')
+                .encode('utf-16', 'surrogatepass')
+                .decode('utf-16', 'replace')
+            )
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return raw.decode('utf-8', 'replace')
+
+
 class DEXHeader:
     def __init__(self, buf):
         # (off, size)
@@ -348,12 +407,12 @@ class DEX:
             return self._strings[str_idx]
 
         str_idx_off = self.header.strings[0]
-        str_size = self.header.strings[1]
         string_off = _STRUCT_I.unpack_from(self.buf, str_idx_off + str_idx * 4)[0]
         utf16_size, c = read_uleb128_fast(self.buf, string_off)
         data_start = string_off + c
-        end = data_start + utf16_size
-        s = bytes(self.buf[data_start:end]).decode('utf-8', errors='replace')
+        # `utf16_size` counts UTF-16 CODE UNITS, not bytes — see mutf8_end.
+        end = mutf8_end(self.buf, data_start, utf16_size)
+        s = decode_mutf8(bytes(self.buf[data_start:end]))
         self._strings[str_idx] = s
         return s
 
@@ -517,7 +576,22 @@ class DEX:
                 left = mid + 1
             else:
                 right = mid - 1
-        
+
+        if type_idx == -1:
+            # Fallback scan. The binary search assumes type_ids are sorted
+            # by the decoded string value, which the DEX spec guarantees
+            # only in UTF-16 code-unit order — astral-plane names can
+            # break it (Python compares code points). Without this, a
+            # premise failure is indistinguishable from "the class is not
+            # in this DEX", which is exactly the wrong answer to hand a
+            # caller that has already found the class in the APK index.
+            # Miss-only: the fast path never pays for it.
+            for mid in range(type_ids_size):
+                desc_idx = _STRUCT_I.unpack_from(raw_bytes, type_ids_off + mid * 0x4)[0]
+                if self.get_string(desc_idx) == fullname:
+                    type_idx = mid
+                    break
+
         if type_idx == -1:
             return None
 
